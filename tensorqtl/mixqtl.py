@@ -9,64 +9,111 @@ from core import *
 
 
 def trc(genotypes_t, counts_t, lib_size_t=None, covariates_t=None, select_covariates=True,
-        count_threshold=0, imputation='offset', mode='standard', return_af=False):
+        count_threshold=20, return_af=False):
     """
     Inputs
       genotypes_t: dosages (variants x samples)
       counts_t: total read counts
       lib_size_t: library size
-      covariates_t: covariates matrix, first column must be intercept
-      mode: if 'standard', parallel regression for each variant in genotypes_t
-            if 'multi', multiple regression for all variants in genotypes_t
-
-    Outputs:
-      tstat, beta, beta_se, sample_size {af, ma_samples, ma_counts}  (mode='standard')
-      beta, beta_se  (mode='multi')
+      covariates_t: covariates matrix, first column MUST be intercept
     """
     if lib_size_t is None:
         lib_size_t = torch.ones_like(counts_t)
 
-    # R: trc = log(trc / 2 / lib_size) - cov
-    y_full_t = torch.log(counts_t / 2.0 / lib_size_t).float()
-    genotypes_t = genotypes_t.float()
-    
+    # R: lhs = log(trc / lib_size / 2)
+    y_full_t = torch.log(counts_t / (lib_size_t * 2.0))
+    device = y_full_t.device
+    dtype = y_full_t.dtype
+
     if covariates_t is not None:
-        covariates_t = covariates_t.float()
+        # R's regress_against_covariate uses all samples that are not NA/inf
+        m_cov_t = ~torch.isinf(y_full_t) & ~torch.isnan(y_full_t)
+        y_cov_t = y_full_t[m_cov_t]
+        c_cov_t = covariates_t[m_cov_t, :]
+
         if select_covariates:
-            # select significant covariates using only nonzero counts to avoid log(-inf)
-            # but wait, counts_t >= count_threshold is applied later.
-            m_valid = ~torch.isinf(y_full_t) & ~torch.isnan(y_full_t)
-            b_t, b_se_t = linreg(covariates_t[m_valid, :], y_full_t[m_valid], dtype=torch.float32)
+            # Step 1: select significant covariates
+            b_t, b_se_t = linreg(c_cov_t, y_cov_t, dtype=dtype)
             tstat_t = b_t / b_se_t
-            m = tstat_t.abs() > 2
-            m[0] = True  # keep intercept
-            sel_covariates_t = covariates_t[:, m]
-        else:
-            sel_covariates_t = covariates_t
+            # R: selected = abs(out[-1, 3]) > 2 (skipping intercept)
+            selected = tstat_t[1:].abs() > 2
 
-        # R's cov_offset is subtracted. Here we can use Residualizer or subtract predicted values.
-        # matrix_ls_trc assumes cov is already estimated.
-        # For simplicity and consistency with tensorqtl, we use Residualizer on the valid samples.
-        residualizer = Residualizer(sel_covariates_t) # Residualizer in core.py handles intercept if not careful
+            if selected.any():
+                # Step 2: calculate predicted response (excluding intercept)
+                sel_mask = torch.cat([torch.tensor([True]).to(device), selected])
+                sel_covariates_cov_t = c_cov_t[:, sel_mask]
+                b_sel_t, _ = linreg(sel_covariates_cov_t, y_cov_t, dtype=dtype)
+
+                # Calculate offset for ALL samples
+                offset_full_t = torch.matmul(covariates_t[:, sel_mask][:, 1:], b_sel_t[1:])
+            else:
+                offset_full_t = torch.zeros_like(y_full_t)
+
+
+
+        else:
+            b_full_t, _ = linreg(c_cov_t, y_cov_t, dtype=dtype)
+            offset_full_t = torch.matmul(covariates_t[:, 1:], b_full_t[1:])
     else:
-        residualizer = None
+        offset_full_t = torch.zeros_like(y_full_t)
 
-    m_t = counts_t >= count_threshold
-    sample_size = m_t.sum().item()
+    # Now filter samples for trcQTL
+    y_target_full_t = y_full_t - offset_full_t
+    m_samples = (counts_t >= count_threshold) & ~torch.isinf(y_full_t) & ~torch.isnan(y_full_t)
+    n_f = m_samples.sum().item()
+    
+    # R's mixqtl (mixqtl/R/mixqtl.R) does h1[is.na(h1)] = 0.5; h2[is.na(h2)] = 0.5 before summing.
+    # We expect genotypes_t to be already imputed if coming from mixqtl().
+    # But if called directly, we ensure no NaNs.
+    X_f = genotypes_t[:, m_samples].clone()
+    X_f[torch.isnan(X_f)] = 1.0 # (0.5 + 0.5)
+    X_f = X_f / 2
+    
+    y_f = y_target_full_t[m_samples]
+    
+    # mask for monomorphic variants
+    is_mono = (X_f.max(1)[0] == X_f.min(1)[0])
+    
+    valid_mask = ~is_mono
+    
+    num_variants = X_f.shape[0]
+    b1 = torch.full([num_variants], np.nan, device=device, dtype=dtype)
+    se1 = torch.full([num_variants], np.nan, device=device, dtype=dtype)
+    tstat = torch.full([num_variants], np.nan, device=device, dtype=dtype)
+    sample_sizes = torch.zeros([num_variants], dtype=torch.long, device=device)
 
-    if mode == 'standard':
-        # genotypes_t/2 to match R's Xtrc = (h1+h2)/2
-        res = cis.calculate_cis_nominal(genotypes_t[:, m_t] / 2, y_full_t[m_t], residualizer=residualizer, return_af=False)
-        if return_af:
-            af, ma_samples, ma_counts = get_allele_stats(genotypes_t)
-            return *res, sample_size, af, ma_samples, ma_counts
-        else:
-            return *res, sample_size
+    if valid_mask.any():
+        X_v = X_f[valid_mask]
+        
+        T1 = torch.matmul(X_v, y_f) # (v_valid,)
+        T2 = y_f.sum() # scalar
+        S11 = (X_v**2).sum(1) # (v_valid,)
+        S12 = X_v.sum(1) # (v_valid,)
+        S22 = float(n_f)
+        
+        delta = S11 * S22 - S12**2
+        b1_v = (S22 * T1 - S12 * T2) / delta
+        b2_v = (S11 * T2 - S12 * T1) / delta # intercept
+        
+        y2_sum = (y_f**2).sum()
+        rsq = y2_sum - 2*b1_v*T1 - 2*b2_v*T2 + 2*b1_v*b2_v*S12 + b1_v**2*S11 + b2_v**2*S22
+        
+        sigma = torch.sqrt(torch.clamp(rsq, min=0) / (n_f - 2))
+        se1_v = sigma * torch.sqrt(S22 / delta)
+        
+        b1[valid_mask] = b1_v
+        se1[valid_mask] = se1_v
+        tstat[valid_mask] = b1_v / se1_v
+        sample_sizes[valid_mask] = n_f
 
-    elif mode.startswith('multi'):
-        X_t = torch.cat([torch.ones([m_t.sum(), 1], dtype=bool).to(genotypes_t.device), genotypes_t[:, m_t].T / 2], axis=1)
-        b_t, b_se_t = linreg(X_t, y_t[m_t], dtype=torch.float32)
-        return b_t[1:], b_se_t[1:]
+    res = (tstat, b1, se1)
+    sample_size = n_f # Return the common sample size
+    
+    if return_af:
+        af, ma_samples, ma_counts = get_allele_stats(genotypes_t)
+        return *res, sample_size, af, ma_samples, ma_counts
+    else:
+        return *res, sample_size
 
 
 def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
@@ -82,9 +129,13 @@ def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
       counts2_t: haplotype 2 read counts (samples)
     """
     device = genotypes1_t.device
-    X_t = (genotypes1_t - genotypes2_t).float()
-    counts1_t = counts1_t.float()
-    counts2_t = counts2_t.float()
+    dtype = genotypes1_t.dtype
+    
+    h1 = genotypes1_t.clone()
+    h2 = genotypes2_t.clone()
+    h1[torch.isnan(h1)] = 0.5
+    h2[torch.isnan(h2)] = 0.5
+    X_t = (h1 - h2)
     
     # Avoid log(0)
     mask_nonzero = (counts1_t > 0) & (counts2_t > 0)
@@ -97,8 +148,8 @@ def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
     
     sample_size = m_t.sum().item()
     if sample_size <= 2:
-        num_variants = X_t.shape[0]
-        nan_t = torch.full([num_variants], np.nan, device=device)
+        num_variants = genotypes1_t.shape[0]
+        nan_t = torch.full([num_variants], np.nan, device=device, dtype=dtype)
         return nan_t, nan_t, nan_t, sample_size
 
     X_f_t = X_t[:, m_t]
@@ -106,36 +157,47 @@ def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
     c1_f_t = counts1_t[m_t]
     c2_f_t = counts2_t[m_t]
     
-    # Weights: harmonic sum 1/(1/c1 + 1/c2)
-    w_t = 1.0 / (1.0 / c1_f_t + 1.0 / c2_f_t)
+    # mask for monomorphic variants
+    is_mono = (X_f_t.max(1)[0] == X_f_t.min(1)[0])
     
-    # Weight capping logic from R implementation
-    weight_cap_val = min(weight_cap, sample_size // 10)
-    w_cutoff = w_t.min() * weight_cap_val
-    w_t = torch.clamp(w_t, max=w_cutoff)
+    valid_mask = ~is_mono
     
-    # Weighted regression via transformation: sqrt(W)y ~ sqrt(W)X (no intercept)
-    sw_t = torch.sqrt(w_t)
-    y_w_t = y_f_t * sw_t
-    X_w_t = X_f_t * sw_t
-    
-    # Solve variant-wise: b = (X_w^T X_w)^-1 (X_w^T y_w)
-    # X_w_t is (variants x samples)
-    XtX = (X_w_t**2).sum(1)
-    Xty = (X_w_t * y_w_t).sum(1)
-    
-    mask_valid = XtX > 0
-    b = torch.full_like(XtX, np.nan)
-    b[mask_valid] = Xty[mask_valid] / XtX[mask_valid]
-    
-    # Standard error: se = sqrt(rss / dof / XtX)
-    # rss = sum((y_w - b*X_w)^2)
-    # Using unsqueeze for broadcasting: (variants, samples) - (variants, 1) * (variants, samples)
-    rss = ((y_w_t.unsqueeze(0) - b.unsqueeze(1) * X_w_t)**2).sum(1)
-    dof = sample_size - 1
-    sigma2 = rss / dof
-    b_se = torch.sqrt(sigma2 / XtX)
-    tstat = b / b_se
+    num_variants = X_f_t.shape[0]
+    b = torch.full([num_variants], np.nan, device=device, dtype=dtype)
+    b_se = torch.full([num_variants], np.nan, device=device, dtype=dtype)
+    tstat = torch.full([num_variants], np.nan, device=device, dtype=dtype)
+
+    if valid_mask.any():
+        X_v = X_f_t[valid_mask]
+        
+        # Weights: harmonic sum 1/(1/c1 + 1/c2)
+        w_t = 1.0 / (1.0 / c1_f_t + 1.0 / c2_f_t)
+        
+        # Weight capping logic from R implementation
+        weight_cap_val = min(weight_cap, sample_size // 10)
+        w_cutoff = w_t.min() * weight_cap_val
+        w_t = torch.clamp(w_t, max=w_cutoff)
+        
+        # Weighted regression via transformation: sqrt(W)y ~ sqrt(W)X (no intercept)
+        sw_t = torch.sqrt(w_t)
+        y_w_t = y_f_t * sw_t
+        X_w_t = X_v * sw_t
+        
+        # Solve variant-wise: b = (X_w^T X_w)^-1 (X_w^T y_w)
+        XtX = (X_w_t**2).sum(1)
+        Xty = (X_w_t * y_w_t).sum(1)
+        
+        b_v = Xty / XtX
+        
+        # Standard error: se = sqrt(rss / dof / XtX)
+        rss = ((y_w_t.unsqueeze(0) - b_v.unsqueeze(1) * X_w_t)**2).sum(1)
+        dof = sample_size - 1
+        sigma2 = rss / dof
+        b_se_v = torch.sqrt(sigma2 / XtX)
+        
+        b[valid_mask] = b_v
+        b_se[valid_mask] = b_se_v
+        tstat[valid_mask] = b_v / b_se_v
     
     return tstat, b, b_se, sample_size
 
@@ -145,10 +207,7 @@ def meta_analyze(trc_b, trc_se, trc_n, asc_b, asc_se, asc_n, n_cutoff=15):
     Meta-analyze TRC and ASC results using inverse-variance weighting.
     """
     device = trc_b.device
-    trc_b = trc_b.float()
-    trc_se = trc_se.float()
-    asc_b = asc_b.float()
-    asc_se = asc_se.float()
+    dtype = trc_b.dtype
     
     # Initialize with NaNs
     meta_b = torch.full_like(trc_b, np.nan)
@@ -196,7 +255,10 @@ def meta_analyze(trc_b, trc_se, trc_n, asc_b, asc_se, asc_n, n_cutoff=15):
     # Calculate p-values
     tstat = meta_b / meta_se
     # Normal distribution approximation for p-values
-    meta_p = 2 * torch.distributions.Normal(0, 1).cdf(-torch.abs(tstat))
+    # Use validate_args=False to avoid error on NaNs
+    dist = torch.distributions.Normal(torch.tensor([0.0], dtype=dtype).to(device), 
+                                      torch.tensor([1.0], dtype=dtype).to(device), validate_args=False)
+    meta_p = 2 * dist.cdf(-torch.abs(tstat))
     
     return meta_b, meta_se, meta_p, meta_method
 
@@ -208,9 +270,16 @@ def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size
     """
     # 1. TRC model
     # Xtrc = (h1 + h2) / 2
-    genotypes_t = genotypes1_t + genotypes2_t
+    # Impute missing genotypes to 0.5 BEFORE summing, to match R
+    h1 = genotypes1_t.clone()
+    h2 = genotypes2_t.clone()
+    h1[torch.isnan(h1)] = 0.5
+    h2[torch.isnan(h2)] = 0.5
+    genotypes_t = h1 + h2
+    
     trc_res = trc(genotypes_t, y_total_t, lib_size_t=lib_size_t, covariates_t=covariates_t, 
                   count_threshold=trc_cutoff, return_af=False)
+
     trc_tstat, trc_b, trc_se, trc_n = trc_res
     
     # 2. ASC model
