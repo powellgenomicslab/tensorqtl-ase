@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import os
 import sys
+import time
 sys.path.insert(1, os.path.dirname(__file__))
 import cis
 from core import *
@@ -264,34 +265,63 @@ def meta_analyze(trc_b, trc_se, trc_n, asc_b, asc_se, asc_n, n_cutoff=15):
 
 
 def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size_t=None,
-           covariates_t=None, trc_cutoff=20, asc_cutoff=5, weight_cap=100, asc_cap=5000, n_cutoff=15):
+           covariates_t=None, trc_cutoff=20, asc_cutoff=5, weight_cap=100, asc_cap=5000,
+           n_cutoff=15, logger=None, verbose=True):
     """
     Combined MixQTL model.
     """
+    if logger is None:
+        logger = SimpleLogger(verbose=verbose)
+
+    device = genotypes1_t.device
+    n_variants, n_samples = genotypes1_t.shape
+    start_time = time.time()
+
+    logger.write('mixQTL mapping')
+    logger.write(f'  * {n_samples} samples')
+    logger.write(f'  * {n_variants} variants')
+    logger.write(f'  * device: {device}')
+    if covariates_t is not None:
+        logger.write(f'  * {covariates_t.shape[1] - 1} covariates')
+    logger.write(f'  * TRC count threshold: {trc_cutoff}')
+    logger.write(f'  * ASC count threshold: {asc_cutoff}  (cap: {asc_cap})')
+    logger.write(f'  * weight cap: {weight_cap}')
+    logger.write(f'  * meta-analysis n threshold: {n_cutoff}')
+
     # 1. TRC model
     # Xtrc = (h1 + h2) / 2
     # Impute missing genotypes to 0.5 BEFORE summing, to match R
+    logger.write('  * running TRC model')
     h1 = genotypes1_t.clone()
     h2 = genotypes2_t.clone()
     h1[torch.isnan(h1)] = 0.5
     h2[torch.isnan(h2)] = 0.5
     genotypes_t = h1 + h2
-    
-    trc_res = trc(genotypes_t, y_total_t, lib_size_t=lib_size_t, covariates_t=covariates_t, 
-                  count_threshold=trc_cutoff, return_af=False)
 
+    trc_res = trc(genotypes_t, y_total_t, lib_size_t=lib_size_t, covariates_t=covariates_t,
+                  count_threshold=trc_cutoff, return_af=False)
     trc_tstat, trc_b, trc_se, trc_n = trc_res
-    
+    logger.write(f'    * {trc_n} samples passed TRC count threshold')
+
     # 2. ASC model
+    logger.write('  * running ASC model')
     asc_res = asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
                   asc_cutoff=asc_cutoff, weight_cap=weight_cap, asc_cap=asc_cap)
     asc_tstat, asc_b, asc_se, asc_n = asc_res
-    
+    logger.write(f'    * {asc_n} samples passed ASC count threshold')
+
     # 3. Meta-analysis
-    meta_b, meta_se, meta_p, meta_method = meta_analyze(trc_b, trc_se, trc_n, 
-                                                        asc_b, asc_se, asc_n, 
+    logger.write('  * running meta-analysis')
+    meta_b, meta_se, meta_p, meta_method = meta_analyze(trc_b, trc_se, trc_n,
+                                                        asc_b, asc_se, asc_n,
                                                         n_cutoff=n_cutoff)
-    
+    method_counts = {m: (meta_method == m).sum() for m in ['meta', 'trc', 'asc', 'None']}
+    logger.write(f'    * meta: {method_counts["meta"]}  trc-only: {method_counts["trc"]}  '
+                 f'asc-only: {method_counts["asc"]}  no result: {method_counts["None"]}')
+
+    logger.write(f'  Time elapsed: {(time.time()-start_time)/60:.2f} min')
+    logger.write('done.')
+
     return {
         'trc_b': trc_b, 'trc_se': trc_se, 'trc_n': trc_n,
         'asc_b': asc_b, 'asc_se': asc_se, 'asc_n': asc_n,
