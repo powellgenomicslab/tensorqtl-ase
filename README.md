@@ -1,3 +1,14 @@
+## 
+
+This is a fork of tensorQTL with some new modules added to efficiently perform allele-specific analysis. 
+
+The goal of this project is to improve the performance of allele-specific expression / accessibility algorithms by re-implementing them with pytorch, enabling faster computation via GPU accelleration.
+
+The new modules are largely vibe-coded, so please proceed with caution. 
+
+* mixQTL: I re-implemented the mixQTL algorithm which is itself a re-implementation of RASQUAL
+* (in progress) CHT: I also provide a new implementation of the Combined Haplotype Test (originally provided as part of WASP) 
+  
 ## tensorQTL
 
 tensorQTL is a GPU-enabled QTL mapper, achieving ~200-300 fold faster *cis*- and *trans*-QTL mapping compared to CPU-based implementations.
