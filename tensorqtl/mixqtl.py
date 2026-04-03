@@ -62,7 +62,18 @@ def trc(genotypes_t, counts_t, lib_size_t=None, covariates_t=None, select_covari
     y_target_full_t = y_full_t - offset_full_t
     m_samples = (counts_t >= count_threshold) & ~torch.isinf(y_full_t) & ~torch.isnan(y_full_t)
     n_f = m_samples.sum().item()
-    
+
+    if n_f <= 2:
+        num_variants = genotypes_t.shape[0]
+        nan_t = torch.full([num_variants], np.nan, device=device, dtype=dtype)
+        res = (nan_t, nan_t.clone(), nan_t.clone())
+        flag = f'low_counts:n={n_f},threshold={count_threshold}'
+        if return_af:
+            af, ma_samples, ma_counts = get_allele_stats(genotypes_t)
+            return *res, n_f, flag, af, ma_samples, ma_counts
+        else:
+            return *res, n_f, flag
+
     # R's mixqtl (mixqtl/R/mixqtl.R) does h1[is.na(h1)] = 0.5; h2[is.na(h2)] = 0.5 before summing.
     # We expect genotypes_t to be already imputed if coming from mixqtl().
     # But if called directly, we ensure no NaNs.
@@ -108,13 +119,14 @@ def trc(genotypes_t, counts_t, lib_size_t=None, covariates_t=None, select_covari
         sample_sizes[valid_mask] = n_f
 
     res = (tstat, b1, se1)
-    sample_size = n_f # Return the common sample size
-    
+    sample_size = n_f
+    flag = 'ok'
+
     if return_af:
         af, ma_samples, ma_counts = get_allele_stats(genotypes_t)
-        return *res, sample_size, af, ma_samples, ma_counts
+        return *res, sample_size, flag, af, ma_samples, ma_counts
     else:
-        return *res, sample_size
+        return *res, sample_size, flag
 
 
 def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
@@ -147,11 +159,16 @@ def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
     m_t = (counts1_t >= asc_cutoff) & (counts2_t >= asc_cutoff) & \
           (counts1_t <= asc_cap) & (counts2_t <= asc_cap)
     
+    no_input = (counts1_t.sum() == 0) and (counts2_t.sum() == 0)
     sample_size = m_t.sum().item()
-    if sample_size <= 2:
+    if no_input or sample_size <= 2:
         num_variants = genotypes1_t.shape[0]
         nan_t = torch.full([num_variants], np.nan, device=device, dtype=dtype)
-        return nan_t, nan_t, nan_t, sample_size
+        if no_input:
+            flag = 'no_ase_snps:ref_and_alt_counts_all_zero'
+        else:
+            flag = f'low_counts:n={sample_size},cutoff={asc_cutoff}'
+        return nan_t, nan_t, nan_t, sample_size, flag
 
     X_f_t = X_t[:, m_t]
     y_f_t = y_t[m_t]
@@ -200,7 +217,7 @@ def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
         b_se[valid_mask] = b_se_v
         tstat[valid_mask] = b_v / b_se_v
     
-    return tstat, b, b_se, sample_size
+    return tstat, b, b_se, sample_size, 'ok'
 
 
 def meta_analyze(trc_b, trc_se, trc_n, asc_b, asc_se, asc_n, n_cutoff=15):
@@ -300,15 +317,15 @@ def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size
 
     trc_res = trc(genotypes_t, y_total_t, lib_size_t=lib_size_t, covariates_t=covariates_t,
                   count_threshold=trc_cutoff, return_af=False)
-    trc_tstat, trc_b, trc_se, trc_n = trc_res
-    logger.write(f'    * {trc_n} samples passed TRC count threshold')
+    trc_tstat, trc_b, trc_se, trc_n, trc_flag = trc_res
+    logger.write(f'    * {trc_n} samples passed TRC count threshold ({trc_flag})')
 
     # 2. ASC model
     logger.write('  * running ASC model')
     asc_res = asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
                   asc_cutoff=asc_cutoff, weight_cap=weight_cap, asc_cap=asc_cap)
-    asc_tstat, asc_b, asc_se, asc_n = asc_res
-    logger.write(f'    * {asc_n} samples passed ASC count threshold')
+    asc_tstat, asc_b, asc_se, asc_n, asc_flag = asc_res
+    logger.write(f'    * {asc_n} samples passed ASC count threshold ({asc_flag})')
 
     # 3. Meta-analysis
     logger.write('  * running meta-analysis')
@@ -323,7 +340,7 @@ def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size
     logger.write('done.')
 
     return {
-        'trc_b': trc_b, 'trc_se': trc_se, 'trc_n': trc_n,
-        'asc_b': asc_b, 'asc_se': asc_se, 'asc_n': asc_n,
+        'trc_b': trc_b, 'trc_se': trc_se, 'trc_n': trc_n, 'trc_flag': trc_flag,
+        'asc_b': asc_b, 'asc_se': asc_se, 'asc_n': asc_n, 'asc_flag': asc_flag,
         'meta_b': meta_b, 'meta_se': meta_se, 'meta_p': meta_p, 'meta_method': meta_method
     }

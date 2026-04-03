@@ -1,6 +1,7 @@
 name: tensorqtl
 dependencies:
 - python=3.11
+- r-base
 - pip
 - pip:
   - numpy
