@@ -18,8 +18,15 @@ def trc(genotypes_t, counts_t, lib_size_t=None, covariates_t=None, select_covari
       lib_size_t: library size
       covariates_t: covariates matrix, first column MUST be intercept
     """
-    if lib_size_t is None:
+    # Cast to float64 for numerical precision (CUDA and CPU both support it)
+    genotypes_t = genotypes_t.to(torch.float64)
+    counts_t = counts_t.to(torch.float64)
+    if lib_size_t is not None:
+        lib_size_t = lib_size_t.to(torch.float64)
+    else:
         lib_size_t = torch.ones_like(counts_t)
+    if covariates_t is not None:
+        covariates_t = covariates_t.to(torch.float64)
 
     # R: lhs = log(trc / lib_size / 2)
     y_full_t = torch.log(counts_t / (lib_size_t * 2.0))
@@ -141,9 +148,15 @@ def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
       counts1_t: haplotype 1 read counts (samples)
       counts2_t: haplotype 2 read counts (samples)
     """
+    # Cast to float64 for numerical precision (CUDA and CPU both support it)
+    genotypes1_t = genotypes1_t.to(torch.float64)
+    genotypes2_t = genotypes2_t.to(torch.float64)
+    counts1_t = counts1_t.to(torch.float64)
+    counts2_t = counts2_t.to(torch.float64)
+
     device = genotypes1_t.device
     dtype = genotypes1_t.dtype
-    
+
     h1 = genotypes1_t.clone()
     h2 = genotypes2_t.clone()
     h1[torch.isnan(h1)] = 0.5
@@ -272,13 +285,26 @@ def meta_analyze(trc_b, trc_se, trc_n, asc_b, asc_se, asc_n, n_cutoff=15):
 
     # Calculate p-values
     tstat = meta_b / meta_se
-    # Normal distribution approximation for p-values
-    # Use validate_args=False to avoid error on NaNs
-    dist = torch.distributions.Normal(torch.tensor([0.0], dtype=dtype).to(device), 
-                                      torch.tensor([1.0], dtype=dtype).to(device), validate_args=False)
-    meta_p = 2 * dist.cdf(-torch.abs(tstat))
-    
-    return meta_b, meta_se, meta_p, meta_method
+
+    # Compute log10(pval) using log_ndtr for numerical stability in the tail.
+    # torch.special.log_ndtr computes log(Phi(x)) accurately even for very
+    # negative x, avoiding the underflow-to-zero problem with direct CDF.
+    # log10(2 * Phi(-|t|)) = log10(2) + log_ndtr(-|t|) / ln(10)
+    log10_pval = torch.full_like(tstat, np.nan)
+    valid_t = ~torch.isnan(tstat)
+    if valid_t.any():
+        log_pval_valid = np.log(2) + torch.special.log_ndtr(-torch.abs(tstat[valid_t]))
+        log10_pval[valid_t] = log_pval_valid / np.log(10)
+
+    # Also compute nominal p-values (will underflow to 0 for extreme t-stats)
+    meta_p = torch.pow(10.0, log10_pval)
+
+    # Flag p-values that underflowed to zero despite having a valid t-statistic.
+    # float64 smallest normal: ~2.2e-308 → log10 ≈ -307.7
+    min_log10 = np.log10(np.finfo(np.float64).tiny)
+    pval_underflow = valid_t & (log10_pval < min_log10)
+
+    return meta_b, meta_se, meta_p, meta_method, log10_pval, pval_underflow
 
 
 def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size_t=None,
@@ -289,6 +315,17 @@ def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size
     """
     if logger is None:
         logger = SimpleLogger(verbose=verbose)
+
+    # Cast all inputs to float64 for numerical precision (CUDA and CPU both support it)
+    genotypes1_t = genotypes1_t.to(torch.float64)
+    genotypes2_t = genotypes2_t.to(torch.float64)
+    counts1_t = counts1_t.to(torch.float64)
+    counts2_t = counts2_t.to(torch.float64)
+    y_total_t = y_total_t.to(torch.float64)
+    if lib_size_t is not None:
+        lib_size_t = lib_size_t.to(torch.float64)
+    if covariates_t is not None:
+        covariates_t = covariates_t.to(torch.float64)
 
     device = genotypes1_t.device
     n_variants, n_samples = genotypes1_t.shape
@@ -329,9 +366,8 @@ def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size
 
     # 3. Meta-analysis
     logger.write('  * running meta-analysis')
-    meta_b, meta_se, meta_p, meta_method = meta_analyze(trc_b, trc_se, trc_n,
-                                                        asc_b, asc_se, asc_n,
-                                                        n_cutoff=n_cutoff)
+    meta_b, meta_se, meta_p, meta_method, log10_pval, pval_underflow = meta_analyze(
+        trc_b, trc_se, trc_n, asc_b, asc_se, asc_n, n_cutoff=n_cutoff)
     method_counts = {m: (meta_method == m).sum() for m in ['meta', 'trc', 'asc', 'None']}
     logger.write(f'    * meta: {method_counts["meta"]}  trc-only: {method_counts["trc"]}  '
                  f'asc-only: {method_counts["asc"]}  no result: {method_counts["None"]}')
@@ -339,8 +375,14 @@ def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size
     logger.write(f'  Time elapsed: {(time.time()-start_time)/60:.2f} min')
     logger.write('done.')
 
+    n_underflow = pval_underflow.sum().item()
+    if n_underflow > 0:
+        logger.write(f'  * WARNING: {n_underflow} p-values underflowed to zero '
+                     f'(use log10_pval for accurate values)')
+
     return {
         'trc_b': trc_b, 'trc_se': trc_se, 'trc_n': trc_n, 'trc_flag': trc_flag,
         'asc_b': asc_b, 'asc_se': asc_se, 'asc_n': asc_n, 'asc_flag': asc_flag,
-        'meta_b': meta_b, 'meta_se': meta_se, 'meta_p': meta_p, 'meta_method': meta_method
+        'meta_b': meta_b, 'meta_se': meta_se, 'meta_p': meta_p, 'meta_method': meta_method,
+        'log10_pval': log10_pval, 'pval_underflow': pval_underflow
     }
