@@ -108,6 +108,14 @@ def cis_nominal(
 
     common_samples = sorted(set.intersection(*sample_sets))
     n_samples = len(common_samples)
+    if n_samples == 0:
+        raise ValueError(
+            "No samples overlap across genotype_df, phenotype_df, and any provided "
+            "hap/counts/lib_size/covariates DataFrames. Check that column/index names match.")
+    if covariates_df is not None and covariates_df.isnull().any().any():
+        raise ValueError("covariates_df contains NaN; impute or drop missing covariates before calling cis_nominal()")
+    if lib_size_s is not None and (lib_size_s <= 0).any():
+        raise ValueError("lib_size_s contains non-positive values; library sizes must be > 0")
     logger.write(f'  * {n_samples} samples (after intersection)')
     logger.write(f'  * {phenotype_df.shape[0]} phenotypes')
     logger.write(f'  * {variant_df.shape[0]} variants')

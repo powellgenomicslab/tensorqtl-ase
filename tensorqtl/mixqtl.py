@@ -19,6 +19,25 @@ def trc(genotypes_t, counts_t, lib_size_t=None, covariates_t=None, select_covari
       lib_size_t: library size
       covariates_t: covariates matrix, first column MUST be intercept
     """
+    if genotypes_t.ndim != 2:
+        raise ValueError(f"genotypes_t must be 2D (variants x samples), got shape {tuple(genotypes_t.shape)}")
+    n_variants, n_samples = genotypes_t.shape
+    if n_variants == 0:
+        raise ValueError("genotypes_t has 0 variants")
+    if n_samples == 0:
+        raise ValueError("genotypes_t has 0 samples")
+    if counts_t.shape != (n_samples,):
+        raise ValueError(f"counts_t shape {tuple(counts_t.shape)} must match genotypes_t n_samples ({n_samples},)")
+    if lib_size_t is not None and lib_size_t.shape != (n_samples,):
+        raise ValueError(f"lib_size_t shape {tuple(lib_size_t.shape)} must be ({n_samples},)")
+    if covariates_t is not None:
+        if covariates_t.ndim != 2:
+            raise ValueError(f"covariates_t must be 2D, got shape {tuple(covariates_t.shape)}")
+        if covariates_t.shape[0] != n_samples:
+            raise ValueError(f"covariates_t has {covariates_t.shape[0]} rows but genotypes_t has {n_samples} samples")
+        if torch.isnan(covariates_t).any():
+            raise ValueError("covariates_t contains NaN; impute or drop missing covariates before calling trc()")
+
     # Cast to float64 for numerical precision (CUDA and CPU both support it)
     genotypes_t = genotypes_t.to(torch.float64)
     counts_t = counts_t.to(torch.float64)
@@ -149,6 +168,18 @@ def asc(genotypes1_t, genotypes2_t, counts1_t, counts2_t,
       counts1_t: haplotype 1 read counts (samples)
       counts2_t: haplotype 2 read counts (samples)
     """
+    if genotypes1_t.ndim != 2:
+        raise ValueError(f"genotypes1_t must be 2D (variants x samples), got shape {tuple(genotypes1_t.shape)}")
+    n_variants, n_samples = genotypes1_t.shape
+    if n_variants == 0:
+        raise ValueError("genotypes1_t has 0 variants")
+    if n_samples == 0:
+        raise ValueError("genotypes1_t has 0 samples")
+    for name, t in [("genotypes2_t", genotypes2_t), ("counts1_t", counts1_t), ("counts2_t", counts2_t)]:
+        expected = (n_variants, n_samples) if t.ndim == 2 else (n_samples,)
+        if t.shape != expected:
+            raise ValueError(f"{name} shape {tuple(t.shape)} inconsistent with genotypes1_t shape {(n_variants, n_samples)}")
+
     # Cast to float64 for numerical precision (CUDA and CPU both support it)
     genotypes1_t = genotypes1_t.to(torch.float64)
     genotypes2_t = genotypes2_t.to(torch.float64)
@@ -347,6 +378,35 @@ def mixqtl(genotypes1_t, genotypes2_t, counts1_t, counts2_t, y_total_t, lib_size
     """
     if logger is None:
         logger = SimpleLogger(verbose=verbose)
+
+    # Input validation
+    if genotypes1_t.ndim != 2:
+        raise ValueError(f"genotypes1_t must be 2D (variants x samples), got shape {tuple(genotypes1_t.shape)}")
+    n_variants, n_samples = genotypes1_t.shape
+    if n_variants == 0:
+        raise ValueError("genotypes1_t has 0 variants")
+    if n_samples == 0:
+        raise ValueError("genotypes1_t has 0 samples")
+    for name, t in [("genotypes2_t", genotypes2_t), ("counts1_t", counts1_t),
+                    ("counts2_t", counts2_t), ("y_total_t", y_total_t)]:
+        expected = (n_variants, n_samples) if t.ndim == 2 else (n_samples,)
+        if t.shape != expected:
+            raise ValueError(f"{name} shape {tuple(t.shape)} inconsistent with genotypes1_t shape {(n_variants, n_samples)}")
+    if lib_size_t is not None:
+        if lib_size_t.shape != (n_samples,):
+            raise ValueError(f"lib_size_t shape {tuple(lib_size_t.shape)} must be ({n_samples},)")
+        if (lib_size_t <= 0).any():
+            raise ValueError("lib_size_t contains non-positive values; library sizes must be > 0")
+    if covariates_t is not None:
+        if covariates_t.ndim != 2:
+            raise ValueError(f"covariates_t must be 2D, got shape {tuple(covariates_t.shape)}")
+        if covariates_t.shape[0] != n_samples:
+            raise ValueError(f"covariates_t has {covariates_t.shape[0]} rows but genotypes1_t has {n_samples} samples")
+        if torch.isnan(covariates_t).any():
+            raise ValueError("covariates_t contains NaN; impute or drop missing covariates before calling mixqtl()")
+        if covariates_t.device != genotypes1_t.device:
+            raise ValueError(
+                f"covariates_t device ({covariates_t.device}) must match genotypes1_t device ({genotypes1_t.device})")
 
     # Cast all inputs to float64 for numerical precision (CUDA and CPU both support it)
     genotypes1_t = genotypes1_t.to(torch.float64)
