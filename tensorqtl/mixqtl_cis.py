@@ -201,9 +201,10 @@ def cis_nominal(
             # Subset genotypes (variants x samples)
             geno_cis = genotype_df.loc[cis_variant_ids].values.astype(np.float64)
 
-            # MAF filter
+            # MAF filter (denominator = 2 * non-missing samples per variant)
             if maf_threshold > 0:
-                af_arr = np.nansum(geno_cis, axis=1) / (2.0 * n_samples)
+                n_obs = np.sum(~np.isnan(geno_cis), axis=1)
+                af_arr = np.nansum(geno_cis, axis=1) / (2.0 * n_obs)
                 maf_arr = np.where(af_arr > 0.5, 1.0 - af_arr, af_arr)
                 maf_pass = maf_arr >= maf_threshold
                 if not maf_pass.any():
