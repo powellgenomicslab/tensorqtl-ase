@@ -6,7 +6,7 @@ The goal of this project is to improve the performance of allele-specific expres
 
 The new modules are largely vibe-coded, so please proceed with caution. 
 
-* mixQTL: I re-implemented the mixQTL algorithm which is itself a re-implementation of RASQUAL
+* mixQTL: Python port of MixQTL that is optimised for larger datasets with gpu acceleration 
 * (in progress) CHT: I also provide a new implementation of the Combined Haplotype Test (originally provided as part of WASP) 
   
 ## tensorQTL
