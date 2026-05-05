@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import pandas as pd
+import scipy.stats
 import os
 import sys
 import time
@@ -286,17 +287,48 @@ def meta_analyze(trc_b, trc_se, trc_n, asc_b, asc_se, asc_n, n_cutoff=15):
     # Calculate p-values
     tstat = meta_b / meta_se
 
-    # Compute log10(pval) using log_ndtr for numerical stability in the tail.
-    # torch.special.log_ndtr computes log(Phi(x)) accurately even for very
-    # negative x, avoiding the underflow-to-zero problem with direct CDF.
-    # log10(2 * Phi(-|t|)) = log10(2) + log_ndtr(-|t|) / ln(10)
+    # Compute log10(pval) using the appropriate distribution per variant:
+    #   - method='meta': z-distribution (n_trc + n_asc >= 2*n_cutoff >> n_cutoff)
+    #   - method='trc':  t-distribution (df=trc_n) if trc_n <= n_cutoff, else z
+    #   - method='asc':  t-distribution (df=asc_n) if asc_n <= n_cutoff, else z
+    # This matches R's get_pval_fast_() which uses t when n <= n_cutoff, z otherwise.
     log10_pval = torch.full_like(tstat, np.nan)
     valid_t = ~torch.isnan(tstat)
-    if valid_t.any():
-        log_pval_valid = np.log(2) + torch.special.log_ndtr(-torch.abs(tstat[valid_t]))
-        log10_pval[valid_t] = log_pval_valid / np.log(10)
 
-    # Also compute nominal p-values (will underflow to 0 for extreme t-stats)
+    # Partition valid variants into those needing t-dist vs z-dist
+    method_arr = meta_method  # numpy object array
+
+    # z-distribution: method='meta', or method='trc'/'asc' with n > n_cutoff
+    mask_z = valid_t & (
+        (torch.from_numpy(method_arr == 'meta').to(device)) |
+        (torch.from_numpy(method_arr == 'trc').to(device) & (trc_n > n_cutoff)) |
+        (torch.from_numpy(method_arr == 'asc').to(device) & (asc_n > n_cutoff))
+    )
+
+    # t-distribution: method='trc' with trc_n <= n_cutoff
+    mask_t_trc = valid_t & torch.from_numpy(method_arr == 'trc').to(device) & (trc_n <= n_cutoff)
+
+    # t-distribution: method='asc' with asc_n <= n_cutoff
+    mask_t_asc = valid_t & torch.from_numpy(method_arr == 'asc').to(device) & (asc_n <= n_cutoff)
+
+    # z-distribution branch (numerically stable via log_ndtr)
+    if mask_z.any():
+        log_pval_z = np.log(2) + torch.special.log_ndtr(-torch.abs(tstat[mask_z]))
+        log10_pval[mask_z] = log_pval_z / np.log(10)
+
+    # t-distribution branch for trc-only variants (df = trc_n, scalar per gene)
+    if mask_t_trc.any():
+        t_arr = tstat[mask_t_trc].cpu().numpy()
+        log10_p_t = (np.log(2) + scipy.stats.t.logsf(np.abs(t_arr), df=trc_n)) / np.log(10)
+        log10_pval[mask_t_trc] = torch.from_numpy(log10_p_t).to(device=device, dtype=tstat.dtype)
+
+    # t-distribution branch for asc-only variants (df = asc_n, scalar per gene)
+    if mask_t_asc.any():
+        t_arr = tstat[mask_t_asc].cpu().numpy()
+        log10_p_t = (np.log(2) + scipy.stats.t.logsf(np.abs(t_arr), df=asc_n)) / np.log(10)
+        log10_pval[mask_t_asc] = torch.from_numpy(log10_p_t).to(device=device, dtype=tstat.dtype)
+
+    # Nominal p-values (will underflow to 0 for extreme t-stats)
     meta_p = torch.pow(10.0, log10_pval)
 
     # Flag p-values that underflowed to zero despite having a valid t-statistic.
